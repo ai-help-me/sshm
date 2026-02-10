@@ -4,9 +4,10 @@
 [![License](https://img.shields.io/badge/License-MIT-green.svg)](LICENSE)
 
 SSHM 是一个专业的终端 SSH 客户端，提供交互式 TUI 主机选择、真正的 SSH 终端会话以及交互式 SFTP 文件传输功能。
-<script src="https://asciinema.org/a/kQKetwXrgvtSV7xA.js" id="asciicast-kQKetwXrgvtSV7xA" async="true"></script>
+
 
 [![asciicast](https://asciinema.org/a/kQKetwXrgvtSV7xA.svg)](https://asciinema.org/a/kQKetwXrgvtSV7xA)
+
 ## 功能特性
 
 ### 交互式 TUI 界面
