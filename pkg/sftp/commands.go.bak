@@ -1,0 +1,958 @@
+package sftp
+
+import (
+	"bufio"
+	"encoding/hex"
+	"context"
+	"fmt"
+	"io"
+	"os"
+	"os/signal"
+	"path/filepath"
+	"strings"
+	"sync"
+	"time"
+
+	"github.com/pkg/sftp"
+	"github.com/schollz/progressbar/v3"
+)
+
+
+// debugLog writes debug information to a log file
+func debugLog(location, message string, data map[string]interface{}) {
+	logFile := "/Users/licong/code/github/sshm/.cursor/debug.log"
+	f, err := os.OpenFile(logFile, os.O_APPEND|os.O_CREATE|os.O_WRONLY, 0644)
+	if err != nil {
+		return
+	}
+	defer f.Close()
+	
+	dataStr := ""
+	for k, v := range data {
+		dataStr += fmt.Sprintf("%s=%v ", k, v)
+	}
+	
+	logLine := fmt.Sprintf(`{"location":"%s","message":"%s","data":{%s},"timestamp":%d}`+"\n",
+		location, message, strings.TrimSpace(dataStr), time.Now().UnixNano())
+	f.WriteString(logLine)
+}
+
+// hexDump returns a hex representation of a string, useful for debugging control characters
+func hexDump(s string) string {
+	return hex.EncodeToString([]byte(s))
+}
+
+
+// Shell implements interactive SFTP shell.
+type Shell struct {
+	client      *sftp.Client
+	paths       *PathState
+	stdin       *bufio.Reader
+	stdout      io.Writer
+	stderr      io.Writer
+	running     bool
+	transferCtx context.Context
+	cancelFunc  context.CancelFunc
+	inputCtx    context.Context
+	inputCancel context.CancelFunc
+	mu          sync.Mutex
+}
+
+// NewShell creates SFTP shell (always in cooked mode).
+func NewShell(client *sftp.Client, paths *PathState) *Shell {
+	return &Shell{
+		client:  client,
+		paths:   paths,
+		stdin:   bufio.NewReader(os.Stdin),
+		stdout:  os.Stdout,
+		stderr:  os.Stderr,
+		running: true,
+	}
+}
+
+// Run starts the interactive shell.
+// Runs in cooked mode - uses terminal Manager for context.
+func (s *Shell) Run() error {
+	fmt.Fprintf(s.stdout, "SFTP shell started. Type 'help' for commands.\n")
+	fmt.Fprintf(s.stdout, "Press Ctrl+C to interrupt file transfers.\n")
+
+	// Set up signal handler for SIGINT (Ctrl+C)
+	sigChan := make(chan os.Signal, 1)
+	signal.Notify(sigChan, os.Interrupt)
+	defer signal.Stop(sigChan)
+
+	for s.running {
+		// Check running status before each iteration
+		if !s.running {
+			return nil
+		}
+		s.showPrompt()
+
+		// Create a new context for this input reading cycle
+		s.mu.Lock()
+		// Cancel previous input context if exists
+		if s.inputCancel != nil {
+			s.inputCancel()
+		}
+		s.inputCtx, s.inputCancel = context.WithCancel(context.Background())
+		inputCtx := s.inputCtx
+		s.mu.Unlock()
+
+		// Wait a short time to ensure previous input reading goroutine has fully exited
+		// This prevents residual data from previous operations (like Ctrl+C) from polluting new input
+		time.Sleep(50 * time.Millisecond)
+		
+		// Clear stdin buffer at the start of each input cycle
+		// This ensures no residual characters from previous operations (like Ctrl+C)
+		// are left in the buffer that could pollute the next input
+		bufferedBefore := s.stdin.Buffered()
+		debugLog("commands.go:100", "clearing stdin buffer at loop start", map[string]interface{}{
+			"buffered": bufferedBefore,
+		})
+		for s.stdin.Buffered() > 0 {
+			b, _ := s.stdin.ReadByte()
+			debugLog("commands.go:105", "discarded byte at loop start", map[string]interface{}{
+				"byte":      b,
+				"byteHex":   fmt.Sprintf("%02x", b),
+				"remaining": s.stdin.Buffered(),
+			})
+		}
+
+		// Create a channel for reading input
+		inputChan := make(chan string, 1)
+		errChan := make(chan error, 1)
+
+		go func() {
+			defer func() {
+				// Recover from any panic in ReadString (e.g., slice bounds out of range)
+				if r := recover(); r != nil {
+					select {
+					case errChan <- fmt.Errorf("read panic: %v", r):
+					case <-inputCtx.Done():
+					}
+				}
+			}()
+			// Use a channel to make ReadString cancellable
+			type readResult struct {
+				line string
+				err  error
+			}
+			readCh := make(chan readResult, 1)
+			go func() {
+				line, err := s.stdin.ReadString('\n')
+				readCh <- readResult{line: line, err: err}
+			}()
+
+			select {
+			case <-inputCtx.Done():
+				// Input reading cancelled (e.g., by Ctrl+C)
+				// Try to read and discard if ReadString already completed
+				select {
+				case <-readCh:
+					// Discard the result since we're cancelled
+				default:
+					// ReadString still in progress, cancellation is fine
+				}
+				return
+			case res := <-readCh:
+				// Check if context was cancelled after read completed
+				select {
+				case <-inputCtx.Done():
+					// Context cancelled after read, discard this input
+					return
+				default:
+					// Context still valid, process the input
+					if res.err != nil {
+						// Handle EOF and other errors safely
+						if res.err == io.EOF {
+							select {
+							case errChan <- io.EOF:
+							case <-inputCtx.Done():
+							}
+							return
+						}
+						// For other errors, try to read what we can if available
+						if len(res.line) > 0 {
+							select {
+							case inputChan <- res.line:
+							case <-inputCtx.Done():
+								// Context cancelled while sending, discard
+							}
+						} else {
+							select {
+							case errChan <- res.err:
+							case <-inputCtx.Done():
+							}
+						}
+						return
+					}
+					// Send the input line
+					select {
+					case inputChan <- res.line:
+					case <-inputCtx.Done():
+						// Context cancelled while sending, discard
+					}
+				}
+			}
+		}()
+
+		// Wait for either input or signal
+		// Also check for active transfer cancellation
+		select {
+		case <-sigChan:
+			// Ctrl+C pressed
+			s.mu.Lock()
+			hasActiveTransfer := s.transferCtx != nil && s.cancelFunc != nil
+			if hasActiveTransfer {
+				// Cancel active transfer
+				if s.cancelFunc != nil {
+					s.cancelFunc()
+				}
+				s.mu.Unlock()
+				fmt.Fprintf(s.stdout, "\n^C\nTransfer cancelled.\n")
+			} else {
+				s.mu.Unlock()
+				// No active transfer, just show prompt again
+				fmt.Fprintf(s.stdout, "^C\n")
+			if s.inputCancel != nil {
+			// Cancel the current input reading goroutine
+			s.mu.Lock()
+			s.inputCancel()
+			s.inputCancel = nil
+			}
+			s.mu.Unlock()
+			// Wait a short time to ensure the input reading goroutine has fully exited
+			// This prevents residual data from being processed in the next loop iteration
+			// Drain any pending input quickly and continue
+			// Use a short timeout to avoid blocking, but drain multiple times if needed
+			drainTimeout := time.After(10 * time.Millisecond)
+			drained := false
+			for !drained {
+				select {
+				case <-inputChan:
+					// Discard any pending input (may contain Ctrl+C characters)
+				case <-errChan:
+					// Discard any pending error
+				case <-drainTimeout:
+					drained = true
+				}
+			}
+			}
+			// Clear stdin buffer to remove any Ctrl+C characters that might be buffered
+			buffered := s.stdin.Buffered()
+			debugLog("commands.go:192", "clearing stdin buffer", map[string]interface{}{
+				"buffered": buffered,
+			})
+			for s.stdin.Buffered() > 0 {
+				b, _ := s.stdin.ReadByte()
+				debugLog("commands.go:195", "discarded byte from buffer", map[string]interface{}{
+					"byte":      b,
+					"byteHex":   fmt.Sprintf("%02x", b),
+					"remaining": s.stdin.Buffered(),
+				})
+			}
+			continue
+
+		case line := <-inputChan:
+			// Log raw input for debugging
+			debugLog("commands.go:198", "raw input received", map[string]interface{}{
+				"raw":      hexDump(line),
+				"rawLen":   len(line),
+				"rawRunes": len([]rune(line)),
+			})
+			
+			// Clean input: remove control characters (including Ctrl+C which is \x03)
+			cleaned := strings.Map(func(r rune) rune {
+				// Keep printable ASCII (32-126), newline, and tab
+				if (r >= 32 && r <= 126) || r == '\n' || r == '\t' {
+					return r
+				}
+				// Remove all other control characters (including Ctrl+C which is \x03)
+				return -1
+			}, line)
+			// Trim whitespace
+			input := strings.TrimSpace(cleaned)
+			
+			// Log cleaned input for debugging
+			debugLog("commands.go:214", "cleaned input", map[string]interface{}{
+				"cleaned":    input,
+				"cleanedHex": hexDump(input),
+				"cleanedLen": len(input),
+			})
+			
+			// If input is empty after cleaning, skip it
+			if input == "" {
+				debugLog("commands.go:220", "input empty after cleaning, skipping", map[string]interface{}{})
+				continue
+			}
+
+			// Check if this is a transfer command
+			parts := strings.Fields(input)
+			isTransfer := len(parts) > 0 && (strings.ToLower(parts[0]) == "get" || strings.ToLower(parts[0]) == "put")
+
+			if isTransfer {
+				// For transfer commands, run in goroutine so we can continue listening for signals
+				transferDone := make(chan error, 1)
+				go func() {
+					transferDone <- s.executeCommand(input)
+				}()
+
+				// Wait for either transfer completion or signal
+				// We need to continue listening to sigChan during transfer
+				for {
+					select {
+					case err := <-transferDone:
+						if err != nil {
+							// Check if error is due to cancellation
+							if err == context.Canceled {
+								fmt.Fprintf(s.stderr, "Transfer cancelled.\n")
+							} else if err.Error() == "exit" {
+								// Exit requested during transfer
+								return nil
+							} else {
+								fmt.Fprintf(s.stderr, "Error: %v\n", err)
+							}
+						}
+						// Transfer completed, break out of the loop
+						goto transferComplete
+					case <-sigChan:
+						// Ctrl+C pressed during transfer
+						s.mu.Lock()
+						hasActiveTransfer := s.transferCtx != nil && s.cancelFunc != nil
+						if hasActiveTransfer {
+							if s.cancelFunc != nil {
+								s.cancelFunc()
+							}
+							s.mu.Unlock()
+							fmt.Fprintf(s.stdout, "\n^C\nTransfer cancelled.\n")
+							// Continue waiting for transfer to finish
+						} else {
+							s.mu.Unlock()
+							// Transfer already finished, just show ^C and break
+							fmt.Fprintf(s.stdout, "^C\n")
+							goto transferComplete
+						}
+					}
+				}
+			transferComplete:
+				// Transfer handling complete, check if we should exit
+				if !s.running {
+					return nil
+				}
+			} else {
+				// For non-transfer commands, execute directly
+				if err := s.executeCommand(input); err != nil {
+					// Check if this is an exit command
+					if err.Error() == "exit" {
+						// Exit requested, break out of loop
+						return nil
+					}
+					fmt.Fprintf(s.stderr, "Error: %v\n", err)
+				}
+			}
+
+		case err := <-errChan:
+			if err == io.EOF {
+				return nil
+			}
+			return fmt.Errorf("read input: %w", err)
+		}
+	}
+
+	return nil
+}
+
+// showPrompt displays sftp> prompt.
+func (s *Shell) showPrompt() {
+	fmt.Fprintf(s.stdout, "sftp:%s> ", s.paths.RemoteCWD)
+}
+
+// executeCommand parses and runs a single SFTP command.
+func (s *Shell) executeCommand(input string) error {
+	// Log input for debugging
+	debugLog("commands.go:298", "executeCommand called", map[string]interface{}{
+		"input":    input,
+		"inputHex": hexDump(input),
+	})
+	
+	// Clean input: remove any control characters and normalize whitespace
+	cleaned := strings.Map(func(r rune) rune {
+		if r >= 32 && r != 127 { // Keep printable ASCII except DEL
+			return r
+		}
+		return -1 // Remove control characters
+	}, input)
+	cleaned = strings.TrimSpace(cleaned)
+
+	parts := strings.Fields(cleaned)
+	if len(parts) == 0 {
+		debugLog("commands.go:312", "no parts after fields split", map[string]interface{}{})
+		return nil
+	}
+
+	cmd := strings.ToLower(strings.TrimSpace(parts[0]))
+	args := parts[1:]
+	
+	// Log command parsing for debugging
+	debugLog("commands.go:318", "command parsed", map[string]interface{}{
+		"cmd":  cmd,
+		"args": args,
+	})
+
+	// Create cancellation context for transfer commands
+	if cmd == "get" || cmd == "put" {
+		s.mu.Lock()
+		// Cancel any previous transfer
+		if s.cancelFunc != nil {
+			s.cancelFunc()
+		}
+		s.transferCtx, s.cancelFunc = context.WithCancel(context.Background())
+		ctx := s.transferCtx
+		s.mu.Unlock()
+
+		// Ensure cleanup after command completes
+		defer func() {
+			s.mu.Lock()
+			if s.cancelFunc != nil {
+				s.cancelFunc()
+				s.cancelFunc = nil
+				s.transferCtx = nil
+			}
+			s.mu.Unlock()
+		}()
+
+		var err error
+		switch cmd {
+		case "get":
+			err = s.cmdGetWithContext(ctx, args)
+		case "put":
+			err = s.cmdPutWithContext(ctx, args)
+		}
+
+		// If cancelled, return the cancellation error
+		if ctx.Err() == context.Canceled {
+			return context.Canceled
+		}
+		return err
+	}
+
+	switch cmd {
+	case "cd":
+		return s.cmdCD(args)
+	case "lcd":
+		return s.cmdLCD(args)
+	case "pwd":
+		return s.cmdPWD(args)
+	case "lpwd":
+		return s.cmdLPWD(args)
+	case "ls":
+		return s.cmdLS(args)
+	case "lls":
+		return s.cmdLLS(args)
+	case "exit", "quit", "bye":
+		// Cancel any active transfer before exiting
+		s.mu.Lock()
+		if s.cancelFunc != nil {
+			s.cancelFunc()
+			s.cancelFunc = nil
+			s.transferCtx = nil
+		}
+		s.mu.Unlock()
+		s.running = false
+		// Return a special error to signal exit
+		return fmt.Errorf("exit")
+	case "help", "?":
+		return s.cmdHelp()
+	default:
+		return fmt.Errorf("unknown command: %s", cmd)
+	}
+}
+
+// cmdCD changes the remote directory.
+func (s *Shell) cmdCD(args []string) error {
+	path := "~"
+	if len(args) > 0 {
+		path = args[0]
+	}
+
+	resolved, err := s.paths.ResolveRemote(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	// Check if directory exists and is accessible
+	fi, err := s.client.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", resolved)
+	}
+
+	// CRITICAL: Update RemoteCWD using RealPath
+	return s.paths.UpdateRemoteCWD(resolved)
+}
+
+// cmdLCD changes the local directory.
+func (s *Shell) cmdLCD(args []string) error {
+	path := "~"
+	if len(args) > 0 {
+		path = args[0]
+	}
+
+	resolved, err := s.paths.ResolveLocal(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	// Check if directory exists
+	fi, err := os.Stat(resolved)
+	if err != nil {
+		return fmt.Errorf("stat: %w", err)
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("%s is not a directory", resolved)
+	}
+
+	return s.paths.UpdateLocalCWD(resolved)
+}
+
+// cmdPWD prints the remote working directory.
+func (s *Shell) cmdPWD(args []string) error {
+	fmt.Fprintf(s.stdout, "Remote working directory: %s\n", s.paths.RemoteCWD)
+	return nil
+}
+
+// cmdLPWD prints the local working directory.
+func (s *Shell) cmdLPWD(args []string) error {
+	fmt.Fprintf(s.stdout, "Local working directory: %s\n", s.paths.LocalCWD)
+	return nil
+}
+
+// cmdLS lists remote files.
+func (s *Shell) cmdLS(args []string) error {
+	path := "."
+	if len(args) > 0 {
+		path = args[0]
+	}
+
+	resolved, err := s.paths.ResolveRemote(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	entries, err := s.client.ReadDir(resolved)
+	if err != nil {
+		return fmt.Errorf("read dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			name += "/"
+		}
+		modTime := entry.ModTime().Format("Jan 02 15:04")
+		size := entry.Size()
+
+		mode := entry.Mode().String()
+		fmt.Fprintf(s.stdout, "%s %8d %s %s\n", mode, size, modTime, name)
+	}
+
+	return nil
+}
+
+// cmdLLS lists local files.
+func (s *Shell) cmdLLS(args []string) error {
+	path := "."
+	if len(args) > 0 {
+		path = args[0]
+	}
+
+	resolved, err := s.paths.ResolveLocal(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	entries, err := os.ReadDir(resolved)
+	if err != nil {
+		return fmt.Errorf("read dir: %w", err)
+	}
+
+	for _, entry := range entries {
+		name := entry.Name()
+		if entry.IsDir() {
+			name += "/"
+		}
+
+		info, _ := entry.Info()
+		modTime := info.ModTime().Format("Jan 02 15:04")
+		size := info.Size()
+
+		mode := info.Mode().String()
+		fmt.Fprintf(s.stdout, "%s %8d %s %s\n", mode, size, modTime, name)
+	}
+
+	return nil
+}
+
+// cmdGet downloads a file from remote to local.
+func (s *Shell) cmdGet(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: get remote-path [local-path]")
+	}
+
+	remotePath, err := s.paths.ResolveRemote(args[0])
+	if err != nil {
+		return fmt.Errorf("resolve remote: %w", err)
+	}
+
+	localPath := ""
+	if len(args) > 1 {
+		localPath, err = s.paths.ResolveLocal(args[1])
+	} else {
+		localPath, err = s.paths.ResolveLocal(filepath.Base(args[0]))
+	}
+	if err != nil {
+		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	// Open remote file
+	srcFile, err := s.client.Open(remotePath)
+	if err != nil {
+		return fmt.Errorf("open remote: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat remote: %w", err)
+	}
+
+	// Create local file
+	dstFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create local: %w", err)
+	}
+	defer dstFile.Close()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription("Downloading"),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap local file with progress writer that implements io.ReaderFrom
+	// This enables SFTP's concurrent read optimization
+	progressDst := newProgressWriterFrom(dstFile, bar)
+
+	// Directly call ReadFrom to enable concurrent reads
+	// The SFTP client will detect the ReaderFrom interface and use concurrent operations
+	_, err = progressDst.ReadFrom(srcFile)
+	if err != nil {
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("read from: %w", err)
+	}
+
+	// Ensure progress bar finishes rendering
+	bar.Close()
+	time.Sleep(10 * time.Millisecond)
+	return nil
+}
+
+// cmdPut uploads a file from local to remote.
+func (s *Shell) cmdPut(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: put local-path [remote-path]")
+	}
+
+	localPath, err := s.paths.ResolveLocal(args[0])
+	if err != nil {
+		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	remotePath := ""
+	if len(args) > 1 {
+		remotePath, err = s.paths.ResolveRemote(args[1])
+	} else {
+		remotePath, err = s.paths.ResolveRemote(filepath.Base(args[0]))
+	}
+	if err != nil {
+		return fmt.Errorf("resolve remote: %w", err)
+	}
+
+	// Open local file
+	srcFile, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
+
+	// Create remote file
+	dstFile, err := s.client.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("create remote: %w", err)
+	}
+	defer dstFile.Close()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription("Uploading"),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap local file with progress writer that provides Size()
+	// This enables SFTP's concurrent write optimization
+	progressSrc := newProgressWriterTo(srcFile, bar, fi.Size())
+
+	// Directly call ReadFrom on the remote file to enable concurrent writes
+	// The SFTP client will use the Size() method to optimize concurrent transfers
+	_, err = dstFile.ReadFrom(progressSrc)
+	if err != nil {
+		dstFile.Close()
+		s.client.Remove(remotePath)
+		return fmt.Errorf("read from: %w", err)
+	}
+
+	// Ensure progress bar finishes rendering
+	bar.Close()
+	time.Sleep(10 * time.Millisecond)
+	fmt.Fprintf(s.stdout, "Upload complete: %s\n", remotePath)
+	return nil
+}
+
+// cmdGetWithContext downloads a file from remote to local with cancellation support.
+func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: get remote-path [local-path]")
+	}
+
+	remotePath, err := s.paths.ResolveRemote(args[0])
+	if err != nil {
+		return fmt.Errorf("resolve remote: %w", err)
+	}
+
+	localPath := ""
+	if len(args) > 1 {
+		localPath, err = s.paths.ResolveLocal(args[1])
+	} else {
+		localPath, err = s.paths.ResolveLocal(filepath.Base(args[0]))
+	}
+	if err != nil {
+		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Open remote file
+	srcFile, err := s.client.Open(remotePath)
+	if err != nil {
+		return fmt.Errorf("open remote: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat remote: %w", err)
+	}
+
+	// Create local file
+	dstFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create local: %w", err)
+	}
+	defer func() {
+		dstFile.Close()
+		// Remove file if cancelled
+		if ctx.Err() == context.Canceled {
+			os.Remove(localPath)
+		}
+	}()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription("Downloading"),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap local file with progress writer that implements io.ReaderFrom with context
+	progressDst := newProgressWriterFromWithContext(dstFile, bar, ctx)
+
+	// Directly call ReadFrom to enable concurrent reads
+	_, err = progressDst.ReadFrom(srcFile)
+	if err != nil {
+		if err == context.Canceled {
+			return context.Canceled
+		}
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("read from: %w", err)
+	}
+
+	// Ensure progress bar finishes rendering
+	bar.Close()
+	time.Sleep(10 * time.Millisecond)
+	return nil
+}
+
+// cmdPutWithContext uploads a file from local to remote with cancellation support.
+func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: put local-path [remote-path]")
+	}
+
+	localPath, err := s.paths.ResolveLocal(args[0])
+	if err != nil {
+		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	remotePath := ""
+	if len(args) > 1 {
+		remotePath, err = s.paths.ResolveRemote(args[1])
+	} else {
+		remotePath, err = s.paths.ResolveRemote(filepath.Base(args[0]))
+	}
+	if err != nil {
+		return fmt.Errorf("resolve remote: %w", err)
+	}
+
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Open local file
+	srcFile, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
+
+	// Create remote file
+	dstFile, err := s.client.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("create remote: %w", err)
+	}
+	defer func() {
+		dstFile.Close()
+		// Remove file if cancelled
+		if ctx.Err() == context.Canceled {
+			s.client.Remove(remotePath)
+		}
+	}()
+
+	// Create progress bar
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription("Uploading"),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap local file with progress writer that provides Size() with context
+	progressSrc := newProgressWriterToWithContext(srcFile, bar, fi.Size(), ctx)
+
+	// Directly call ReadFrom on the remote file to enable concurrent writes
+	_, err = dstFile.ReadFrom(progressSrc)
+	if err != nil {
+		if err == context.Canceled {
+			return context.Canceled
+		}
+		dstFile.Close()
+		s.client.Remove(remotePath)
+		return fmt.Errorf("read from: %w", err)
+	}
+
+	// Ensure progress bar finishes rendering
+	bar.Close()
+	time.Sleep(10 * time.Millisecond)
+	fmt.Fprintf(s.stdout, "Upload complete: %s\n", remotePath)
+	return nil
+}
+
+// cmdHelp shows help information.
+func (s *Shell) cmdHelp() error {
+	fmt.Fprintf(s.stdout, `Available commands:
+  cd <path>      Change remote directory
+  lcd <path>     Change local directory
+  pwd            Print remote working directory
+  lpwd           Print local working directory
+  ls [path]      List remote files
+  lls [path]     List local files
+  get <remote> [local]   Download file
+  put <local> [remote]   Upload file
+  exit           Exit SFTP shell
+`)
+	return nil
+}
