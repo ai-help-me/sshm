@@ -1,36 +1,24 @@
-//go:build !windows
-// +build !windows
+//go:build windows
+// +build windows
 
 package terminal
 
 import (
 	"os"
-	"os/signal"
-	"syscall"
 	"time"
 
 	"golang.org/x/term"
 )
 
-// handleWinch listens for SIGWINCH signals and forwards window size changes to the SSH session.
-//
-// This runs in a goroutine started by EnterRaw() and stopped by Restore().
+// handleWinch is a no-op on Windows since SIGWINCH is not available.
+// Window resize handling on Windows would require different mechanisms
+// (like console API events), which are not implemented in this SSH client.
 func (m *Manager) handleWinch() {
-	sigWinch := make(chan os.Signal, 1)
-	signal.Notify(sigWinch, syscall.SIGWINCH)
-
-	for {
-		select {
-		case <-sigWinch:
-			m.updateWindowSize()
-		case <-m.stopResize:
-			signal.Stop(sigWinch)
-			return
-		}
-	}
+	// No-op on Windows
 }
 
 // updateWindowSize gets the current terminal size and sends it to the SSH session.
+// This can still be called manually on Windows, but won't be triggered by signals.
 func (m *Manager) updateWindowSize() {
 	m.mu.Lock()
 	if !m.inRawMode || m.session == nil {
