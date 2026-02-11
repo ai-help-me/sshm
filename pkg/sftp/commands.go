@@ -183,7 +183,7 @@ func (s *Shell) executeTransferCommand(ctx context.Context, input string) error 
 
 // showPrompt displays sftp> prompt.
 func (s *Shell) showPrompt() {
-	fmt.Fprintf(s.stdout, "sftp %s@%s:%s> ", s.user, s.host, s.paths.RemoteCWD)
+	fmt.Fprintf(s.stdout, "\033[1;32msftp %s@%s:%s>\033[0m ", s.user, s.host, s.paths.RemoteCWD)
 	// Force flush stdout to ensure prompt is visible immediately
 	// Use both Sync() and explicit flush for terminal output
 	if f, ok := s.stdout.(*os.File); ok {
@@ -219,6 +219,10 @@ func (s *Shell) executeCommand(input string) error {
 		return s.cmdLS(args)
 	case "lls":
 		return s.cmdLLS(args)
+	case "mkdir":
+		return s.cmdMkdir(args)
+	case "lmkdir":
+		return s.cmdLMkdir(args)
 	case "exit", "quit", "bye":
 		// Return a special error to signal exit
 		return fmt.Errorf("exit")
@@ -377,6 +381,11 @@ func (s *Shell) cmdGet(args []string) error {
 		return fmt.Errorf("resolve local: %w", err)
 	}
 
+	// Check if local path is a directory, if so append the filename
+	if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
+		localPath = filepath.Join(localPath, filepath.Base(remotePath))
+	}
+
 	// Open remote file
 	srcFile, err := s.client.Open(remotePath)
 	if err != nil {
@@ -453,6 +462,11 @@ func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	// Check if local path is a directory, if so append the filename
+	if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
+		localPath = filepath.Join(localPath, filepath.Base(remotePath))
 	}
 
 	// Check for cancellation before starting
@@ -567,6 +581,11 @@ func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
 		return fmt.Errorf("resolve remote: %w", err)
 	}
 
+	// Check if remote path is a directory, if so append the filename
+	if stat, err := s.client.Stat(remotePath); err == nil && stat.IsDir() {
+		remotePath = filepath.Join(remotePath, filepath.Base(localPath))
+	}
+
 	// Check for cancellation before starting
 	select {
 	case <-ctx.Done():
@@ -662,18 +681,68 @@ func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
 	return nil
 }
 
+// cmdMkdir creates a directory on the remote server.
+func (s *Shell) cmdMkdir(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: mkdir <path>")
+	}
+
+	path := args[0]
+	resolved, err := s.paths.ResolveRemote(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	err = s.client.MkdirAll(resolved)
+	if err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	fmt.Fprintf(s.stdout, "Created remote directory: %s\n", resolved)
+	return nil
+}
+
+// cmdLMkdir creates a directory on the local machine.
+func (s *Shell) cmdLMkdir(args []string) error {
+	if len(args) < 1 {
+		return fmt.Errorf("usage: lmkdir <path>")
+	}
+
+	path := args[0]
+	resolved, err := s.paths.ResolveLocal(path)
+	if err != nil {
+		return fmt.Errorf("resolve path: %w", err)
+	}
+
+	err = os.MkdirAll(resolved, 0755)
+	if err != nil {
+		return fmt.Errorf("mkdir: %w", err)
+	}
+
+	fmt.Fprintf(s.stdout, "Created local directory: %s\n", resolved)
+	return nil
+}
+
+// ANSI color codes
+const (
+	colorGreenBold = "\033[1;32m"
+	colorGreen     = "\033[32m"
+	colorReset     = "\033[0m"
+)
+
 // cmdHelp shows help information.
 func (s *Shell) cmdHelp() error {
-	fmt.Fprintf(s.stdout, `Available commands:
-  cd <path>      Change remote directory
-  lcd <path>     Change local directory
-  pwd            Print remote working directory
-  lpwd           Print local working directory
-  ls [path]      List remote files
-  lls [path]     List local files
-  get <remote> [local]   Download file
-  put <local> [remote]   Upload file
-  exit           Exit SFTP shell
-`)
+	fmt.Fprintf(s.stdout, "%sAvailable commands:%s\n", colorGreenBold, colorReset)
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Change remote directory\n", colorGreen, "cd", colorReset, "<path>")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Change local directory\n", colorGreen, "lcd", colorReset, "<path>")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Print remote working directory\n", colorGreen, "pwd", colorReset, "")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Print local working directory\n", colorGreen, "lpwd", colorReset, "")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s List remote files\n", colorGreen, "ls", colorReset, "[path]")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s List local files\n", colorGreen, "lls", colorReset, "[path]")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Download file\n", colorGreen, "get", colorReset, "<remote> [local]")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Upload file\n", colorGreen, "put", colorReset, "<local> [remote]")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Create remote directory\n", colorGreen, "mkdir", colorReset, "<path>")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Create local directory\n", colorGreen, "lmkdir", colorReset, "<path>")
+	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Exit SFTP shell\n", colorGreen, "exit", colorReset, "")
 	return nil
 }
