@@ -7,25 +7,43 @@ import (
 	"encoding/pem"
 	"fmt"
 	"os"
+	"path/filepath"
 
 	"golang.org/x/crypto/ssh"
+	"golang.org/x/crypto/ssh/agent"
+	"net"
 )
 
+// Default SSH key paths to try when no keypath is specified
+var defaultKeyPaths = []string{
+	"~/.ssh/id_ed25519",
+	"~/.ssh/id_rsa",
+	"~/.ssh/id_ecdsa",
+	"~/.ssh/id_dsa",
+}
+
 // AuthMethods returns authentication methods for a host configuration.
-// Priority: key auth > password auth.
-// Returns empty list for SSH agent or keyboard-interactive auth.
+// Priority: key auth > password auth > ssh agent.
 func AuthMethods(host *HostConfig) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
-	// Try key authentication first
+	// Try key authentication first (explicit keypath)
 	if host.KeyPath != "" {
 		keyAuth, err := keyAuthMethod(host.KeyPath)
 		if err == nil {
 			methods = append(methods, keyAuth)
 		} else {
-			// If key fails, we'll still try password
-			// Log the error but don't fail
 			fmt.Fprintf(os.Stderr, "Warning: key auth failed: %v\n", err)
+		}
+	} else {
+		// No explicit keypath, try default SSH keys
+		for _, keyPath := range defaultKeyPaths {
+			expandedPath := expandPath(keyPath)
+			keyAuth, err := keyAuthMethod(expandedPath)
+			if err == nil {
+				methods = append(methods, keyAuth)
+				break // Use first valid key found
+			}
 		}
 	}
 
@@ -34,20 +52,34 @@ func AuthMethods(host *HostConfig) ([]ssh.AuthMethod, error) {
 		methods = append(methods, ssh.Password(host.Password))
 	}
 
-	// Return empty list for SSH agent or keyboard-interactive auth
+	// Try SSH agent as fallback
+	if agentAuth := trySSHAgent(); agentAuth != nil {
+		methods = append(methods, agentAuth)
+	}
+
 	return methods, nil
 }
 
 // AuthMethodsFromConfig creates authentication methods from individual config values.
-// Returns empty list for SSH agent or keyboard-interactive auth.
+// Also tries default keys and SSH agent if no explicit key provided.
 func AuthMethodsFromConfig(keyPath, password string) ([]ssh.AuthMethod, error) {
 	var methods []ssh.AuthMethod
 
-	// Try key authentication first
+	// Try key authentication first (explicit keypath)
 	if keyPath != "" {
 		keyAuth, err := keyAuthMethod(keyPath)
 		if err == nil {
 			methods = append(methods, keyAuth)
+		}
+	} else {
+		// No explicit keypath, try default SSH keys
+		for _, defaultPath := range defaultKeyPaths {
+			expandedPath := expandPath(defaultPath)
+			keyAuth, err := keyAuthMethod(expandedPath)
+			if err == nil {
+				methods = append(methods, keyAuth)
+				break // Use first valid key found
+			}
 		}
 	}
 
@@ -56,7 +88,11 @@ func AuthMethodsFromConfig(keyPath, password string) ([]ssh.AuthMethod, error) {
 		methods = append(methods, ssh.Password(password))
 	}
 
-	// Return empty list for SSH agent or keyboard-interactive auth
+	// Try SSH agent as fallback
+	if agentAuth := trySSHAgent(); agentAuth != nil {
+		methods = append(methods, agentAuth)
+	}
+
 	return methods, nil
 }
 
@@ -101,6 +137,39 @@ func keyAuthMethod(keyPath string) (ssh.AuthMethod, error) {
 	}
 
 	return ssh.PublicKeys(signers[0]), nil
+}
+
+// expandPath expands ~ to home directory
+func expandPath(path string) string {
+	if path == "" || path[0] != '~' {
+		return path
+	}
+	home, err := os.UserHomeDir()
+	if err != nil {
+		return path
+	}
+	return filepath.Join(home, path[1:])
+}
+
+// trySSHAgent attempts to connect to SSH agent and return auth method
+func trySSHAgent() ssh.AuthMethod {
+	if os.Getenv("SSH_AUTH_SOCK") == "" {
+		return nil
+	}
+
+	conn, err := net.Dial("unix", os.Getenv("SSH_AUTH_SOCK"))
+	if err != nil {
+		return nil
+	}
+	defer conn.Close()
+
+	ag := agent.NewClient(conn)
+	signers, err := ag.Signers()
+	if err != nil || len(signers) == 0 {
+		return nil
+	}
+
+	return ssh.PublicKeys(signers...)
 }
 
 // GenerateKey generates a new RSA key pair for testing.
