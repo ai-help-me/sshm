@@ -15,6 +15,13 @@ import (
 	"github.com/schollz/progressbar/v3"
 )
 
+// Table column widths
+const (
+	cmdWidth  = 10
+	argsWidth = 20
+	descWidth = 35
+)
+
 // formatBytes formats byte size to human readable string
 func formatBytes(bytes int64) string {
 	const (
@@ -727,22 +734,67 @@ func (s *Shell) cmdLMkdir(args []string) error {
 const (
 	colorGreenBold = "\033[1;32m"
 	colorGreen     = "\033[32m"
+	colorGray      = "\033[90m"
 	colorReset     = "\033[0m"
 )
 
 // cmdHelp shows help information.
 func (s *Shell) cmdHelp() error {
-	fmt.Fprintf(s.stdout, "%sAvailable commands:%s\n", colorGreenBold, colorReset)
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Change remote directory\n", colorGreen, "cd", colorReset, "<path>")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Change local directory\n", colorGreen, "lcd", colorReset, "<path>")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Print remote working directory\n", colorGreen, "pwd", colorReset, "")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Print local working directory\n", colorGreen, "lpwd", colorReset, "")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s List remote files\n", colorGreen, "ls", colorReset, "[path]")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s List local files\n", colorGreen, "lls", colorReset, "[path]")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Download file\n", colorGreen, "get", colorReset, "<remote> [local]")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Upload file\n", colorGreen, "put", colorReset, "<local> [remote]")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Create remote directory\n", colorGreen, "mkdir", colorReset, "<path>")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Create local directory\n", colorGreen, "lmkdir", colorReset, "<path>")
-	fmt.Fprintf(s.stdout, "  %s%-4s%s %-22s Exit SFTP shell\n", colorGreen, "exit", colorReset, "")
+	commands := []struct {
+		cmd  string
+		args string
+		desc string
+	}{
+		{"cd", "<path>", "Change remote directory"},
+		{"lcd", "<path>", "Change local directory"},
+		{"pwd", "", "Print remote working directory"},
+		{"lpwd", "", "Print local working directory"},
+		{"ls", "[path]", "List remote files"},
+		{"lls", "[path]", "List local files"},
+		{"get", "<remote> [local]", "Download file"},
+		{"put", "<local> [remote]", "Upload file"},
+		{"mkdir", "<path>", "Create remote directory"},
+		{"lmkdir", "<path>", "Create local directory"},
+		{"exit", "", "Exit SFTP shell"},
+		{"quit", "", "Exit SFTP shell (alias)"},
+		{"bye", "", "Exit SFTP shell (alias)"},
+	}
+
+	// 上边框
+	s.printTableLine("┌", "┬", "┐")
+
+	// 表头
+	s.printTableRow("COMMAND", "ARGUMENTS", "DESCRIPTION", colorGray, colorGray, colorGray)
+
+	// 分隔线
+	s.printTableLine("├", "┼", "┤")
+
+	// 数据行
+	for _, c := range commands {
+		s.printTableRow(c.cmd, c.args, c.desc, colorGreen, colorReset, colorReset)
+	}
+
+	// 下边框
+	s.printTableLine("└", "┴", "┘")
+
 	return nil
+}
+
+// printTableLine prints a horizontal table line
+func (s *Shell) printTableLine(left, mid, right string) {
+	fmt.Fprintf(s.stdout, "  %s%s%s%s%s%s\n",
+		left,
+		strings.Repeat("─", cmdWidth+2),
+		mid,
+		strings.Repeat("─", argsWidth+2),
+		mid,
+		strings.Repeat("─", descWidth+2)+right)
+}
+
+// printTableRow prints a table row
+func (s *Shell) printTableRow(col1, col2, col3, c1Color, c2Color, c3Color string) {
+	fmt.Fprintf(s.stdout, "  │ %s%-*s%s │ %s%-*s%s │ %s%-*s%s │\n",
+		c1Color, cmdWidth, col1, colorReset,
+		c2Color, argsWidth, col2, colorReset,
+		c3Color, descWidth, col3, colorReset)
 }
