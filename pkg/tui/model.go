@@ -414,7 +414,7 @@ func (m Model) renderBanner() string {
 	b.WriteString("\n\n")
 	b.WriteString(m.styles.BannerDesc.Render("SSH/SFTP Connection Manager"))
 	b.WriteString("\n")
-	b.WriteString(m.styles.BannerVersion.Render("v" + version))
+	b.WriteString(m.styles.BannerVersion.Render("Version: " + version))
 	b.WriteString("\n")
 
 	return b.String()
