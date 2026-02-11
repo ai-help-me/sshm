@@ -403,6 +403,7 @@ func (m Model) renderBanner() string {
 		}
 	}
 
+	b.WriteString("\n")
 	// ASCII art for SSHM (block chars, no shadow)
 	logo := `  ███████ ███████ ██   ██ ███   ███
   ██      ██      ██   ██ ████ ████
