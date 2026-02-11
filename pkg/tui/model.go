@@ -1,6 +1,7 @@
 package tui
 
 import (
+	"runtime/debug"
 	"strings"
 
 	"github.com/ai-help-me/sshm/pkg/config"
@@ -259,8 +260,8 @@ func (m Model) View() string {
 
 	var b strings.Builder
 
-	// Title
-	b.WriteString(m.styles.Title.Render("SSHM - SSH Client"))
+	// Banner
+	b.WriteString(m.renderBanner())
 	b.WriteString("\n")
 
 	switch m.mode {
@@ -386,6 +387,35 @@ func (m Model) renderActionSelect() string {
 
 	b.WriteString("\n")
 	b.WriteString(m.styles.HostItemDim.Render("Press ESC to go back"))
+
+	return b.String()
+}
+
+// renderBanner renders the SSHM ASCII art banner.
+func (m Model) renderBanner() string {
+	var b strings.Builder
+
+	// Get version from build info
+	version := "dev"
+	if info, ok := debug.ReadBuildInfo(); ok {
+		if info.Main.Version != "" && info.Main.Version != "(devel)" {
+			version = info.Main.Version
+		}
+	}
+
+	// ASCII art for SSHM (block chars, no shadow)
+	logo := `  ███████ ███████ ██   ██ ███   ███
+  ██      ██      ██   ██ ████ ████
+  ███████ ███████ ███████ ██ ███ ██
+       ██      ██ ██   ██ ██  █  ██
+  ███████ ███████ ██   ██ ██     ██`
+
+	b.WriteString(m.styles.BannerLogo.Render(logo))
+	b.WriteString("\n\n")
+	b.WriteString(m.styles.BannerDesc.Render("SSH/SFTP Connection Manager"))
+	b.WriteString("\n")
+	b.WriteString(m.styles.BannerVersion.Render("v" + version))
+	b.WriteString("\n")
 
 	return b.String()
 }

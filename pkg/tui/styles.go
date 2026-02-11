@@ -28,6 +28,11 @@ type Styles struct {
 	ModePrompt   lipgloss.Style
 	ModeOption   lipgloss.Style
 	ModeSelected lipgloss.Style
+
+	// Banner
+	BannerLogo    lipgloss.Style
+	BannerDesc    lipgloss.Style
+	BannerVersion lipgloss.Style
 }
 
 // DefaultStyles returns the default styling.
@@ -106,6 +111,18 @@ func DefaultStyles() Styles {
 		PaddingRight(1).
 		Foreground(primaryColor).
 		Bold(true)
+
+	// Banner styles
+	styles.BannerLogo = lipgloss.NewStyle().
+		Foreground(primaryColor).
+		Bold(true)
+
+	styles.BannerDesc = lipgloss.NewStyle().
+		Foreground(lipgloss.Color("white")).
+		Bold(true)
+
+	styles.BannerVersion = lipgloss.NewStyle().
+		Foreground(dimColor)
 
 	return styles
 }
