@@ -5,6 +5,9 @@
 
 SSHM 是一个专业的终端 SSH 客户端，提供交互式 TUI 主机选择、真正的 SSH 终端会话以及交互式 SFTP 文件传输功能。
 
+
+[![asciicast](https://asciinema.org/a/kQKetwXrgvtSV7xA.svg)](https://asciinema.org/a/kQKetwXrgvtSV7xA)
+
 ## 功能特性
 
 ### 交互式 TUI 界面
@@ -32,7 +35,9 @@ SSHM 是一个专业的终端 SSH 客户端，提供交互式 TUI 主机选择�
 - 兼容 sshw 配置文件格式
 
 ## 安装
-
+```bash
+go install github.com/ai-help-me/sshm@latest
+```
 ### 从源码编译
 
 ```bash
@@ -71,19 +76,6 @@ go install
   user: ubuntu
   port: 22
   keypath: ~/.ssh/id_rsa
-
-# 带跳板主机
-- name: production-web
-  host: 10.0.1.50
-  user: deploy
-  port: 22
-  keypath: ~/.ssh/prod_key
-  jump:
-    - name: bastion
-      host: bastion.example.com
-      user: admin
-      port: 22
-      keypath: ~/.ssh/bastion_key
 
 # 主机分组
 - name: k8s-cluster
@@ -164,31 +156,10 @@ sshm
 | `port` | int | 否 | SSH 端口，默认 22 |
 | `password` | string | 否 | 登录密码 |
 | `keypath` | string | 否 | SSH 私钥路径 |
-| `jump` | array | 否 | 跳板主机列表 |
 | `children` | array | 否 | 子主机列表（分组） |
 
 *注：仅当没有 `children` 时需要填写
 
-### 跳板主机配置
-
-支持多级跳板，按顺序连接：
-
-```yaml
-- name: internal-server
-  host: 192.168.100.50
-  user: admin
-  jump:
-    - name: jump1
-      host: jump1.example.com
-      user: jumper
-      keypath: ~/.ssh/jump1_key
-    - name: jump2
-      host: jump2.internal.com
-      user: jumper
-      keypath: ~/.ssh/jump2_key
-```
-
-连接路径：`localhost -> jump1 -> jump2 -> internal-server`
 
 ## 终端行为
 
@@ -208,15 +179,6 @@ Raw 模式是临时的，在 SSH 会话结束后自动恢复终端状态。
 - `/` - 搜索
 - `q` / `Ctrl+C` - 退出
 
-### SSH 会话
-- 所有按键直接发送到远程服务器
-- `~.` - SSH 转义序列（如支持）
-- 退出远程 shell 自动返回 TUI
-
-### SFTP Shell
-- `Ctrl+C` - 中断当前文件传输
-- `Tab` - 命令补全（如支持）
-- `↑↓` - 命令历史（如支持）
 
 ## 开发
 
@@ -271,5 +233,5 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 欢迎提交 Issue 和 Pull Request！
 
 ## 作者
-
-AI Help Me Team
+- Opus 4.6
+- GLM 4.7
