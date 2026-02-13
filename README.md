@@ -19,7 +19,6 @@ SSHM 是一个专业的终端 SSH 客户端，提供交互式 TUI 主机选择�
 ### SSH 会话
 - 真正的 SSH 终端行为（类似 OpenSSH / iTerm / SecureCRT）
 - 支持密码认证和 SSH 密钥认证
-- 支持跳板主机（Jump Host）多级跳转
 - 完整的终端生命周期管理
 
 ### SFTP 文件传输
@@ -235,3 +234,4 @@ MIT License - 详见 [LICENSE](LICENSE) 文件
 ## 作者
 - Opus 4.6
 - GLM 4.7
+- Kimi K2.5
