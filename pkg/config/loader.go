@@ -8,7 +8,7 @@ import (
 )
 
 // Load reads and parses the configuration from the specified path.
-// If path is empty, loads and merges ~/.sshm.yaml and ~/.sshw.yaml in order.
+// If path is empty, tries ~/.sshm.yaml first, falls back to ~/.sshw if not found.
 // Expands ~ in the path before reading.
 func Load(path string) (*Config, error) {
 	if path == "" {
@@ -24,15 +24,12 @@ func Load(path string) (*Config, error) {
 	return loadSingleConfig(expandedPath)
 }
 
-// loadDefaultConfigs loads and merges ~/.sshm.yaml and ~/.sshw.yaml
+// loadDefaultConfigs loads ~/.sshm.yaml if it exists, otherwise falls back to ~/.sshw
 func loadDefaultConfigs() (*Config, error) {
 	paths, err := DefaultConfigPaths()
 	if err != nil {
 		return nil, err
 	}
-
-	var allHosts []*Host
-	var loadedCount int
 
 	for _, path := range paths {
 		expandedPath, err := expandPath(path)
@@ -45,34 +42,16 @@ func loadDefaultConfigs() (*Config, error) {
 			continue
 		}
 
+		// Found the first existing config file, load it
 		cfg, err := loadSingleConfig(expandedPath)
 		if err != nil {
-			// Log warning but continue with other files
-			fmt.Fprintf(os.Stderr, "Warning: failed to load %s: %v\n", expandedPath, err)
-			continue
+			return nil, fmt.Errorf("failed to load %s: %w", expandedPath, err)
 		}
 
-		allHosts = append(allHosts, cfg.Hosts...)
-		loadedCount++
+		return cfg, nil
 	}
 
-	if loadedCount == 0 {
-		return nil, fmt.Errorf("no config files found (tried: %v)", paths)
-	}
-
-	// Create merged config
-	cfg := &Config{
-		Hosts: allHosts,
-	}
-
-	// Validate all hosts
-	for i, host := range cfg.Hosts {
-		if err := host.Validate(); err != nil {
-			return nil, fmt.Errorf("validate host #%d (%s): %w", i, host.Name, err)
-		}
-	}
-
-	return cfg, nil
+	return nil, fmt.Errorf("no config files found (tried: %v)", paths)
 }
 
 // loadSingleConfig loads a single config file

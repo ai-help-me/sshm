@@ -164,7 +164,7 @@ func DefaultConfigPath() (string, error) {
 }
 
 // DefaultConfigPaths returns the list of default configuration file paths.
-// Loads in order: ~/.sshm.yaml, then ~/.sshw.yaml
+// Tries ~/.sshm.yaml first, falls back to ~/.sshw if not found.
 func DefaultConfigPaths() ([]string, error) {
 	home, err := homedir.Dir()
 	if err != nil {
