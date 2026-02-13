@@ -320,7 +320,7 @@ func (s *Shell) cmdLS(args []string) error {
 
 	for _, entry := range entries {
 		name := entry.Name()
-		if entry.IsDir() {
+		if entry.Mode().IsDir() {
 			name += "/"
 		}
 		modTime := entry.ModTime().Format("Jan 02 15:04")
@@ -367,7 +367,7 @@ func (s *Shell) cmdLLS(args []string) error {
 	return nil
 }
 
-// cmdGet downloads a file from remote to local.
+// cmdGet downloads a file or directory from remote to local.
 func (s *Shell) cmdGet(args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: get remote-path [local-path]")
@@ -386,6 +386,16 @@ func (s *Shell) cmdGet(args []string) error {
 	}
 	if err != nil {
 		return fmt.Errorf("resolve local: %w", err)
+	}
+
+	// Check if remote path is a directory
+	remoteInfo, err := s.client.Stat(remotePath)
+	if err != nil {
+		return fmt.Errorf("stat remote: %w", err)
+	}
+
+	if remoteInfo.Mode().IsDir() {
+		return s.downloadDirectory(context.Background(), remotePath, localPath)
 	}
 
 	// Check if local path is a directory, if so append the filename
@@ -450,7 +460,7 @@ func (s *Shell) cmdGet(args []string) error {
 	return nil
 }
 
-// cmdGetWithContext downloads a file from remote to local with cancellation support.
+// cmdGetWithContext downloads a file or directory from remote to local with cancellation support.
 func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: get remote-path [local-path]")
@@ -471,6 +481,29 @@ func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
 		return fmt.Errorf("resolve local: %w", err)
 	}
 
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Check if remote path is a directory
+	remoteInfo, err := s.client.Stat(remotePath)
+	if err != nil {
+		return fmt.Errorf("stat remote: %w", err)
+	}
+
+	if remoteInfo.Mode().IsDir() {
+		return s.downloadDirectory(ctx, remotePath, localPath)
+	}
+
+	// Single file download
+	return s.downloadSingleFile(ctx, remotePath, localPath)
+}
+
+// downloadSingleFile downloads a single file from remote to local.
+func (s *Shell) downloadSingleFile(ctx context.Context, remotePath, localPath string) error {
 	// Check if local path is a directory, if so append the filename
 	if stat, err := os.Stat(localPath); err == nil && stat.IsDir() {
 		localPath = filepath.Join(localPath, filepath.Base(remotePath))
@@ -539,6 +572,11 @@ func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
 	// Use io.CopyBuffer with large buffer for better performance
 	buf := make([]byte, 1024*1024) // 1MB buffer
 	written, err := io.CopyBuffer(progressWriter, srcFile, buf)
+	if err != nil {
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("copy file: %w", err)
+	}
 
 	// Verify file size matches expected
 	if written != fi.Size() {
@@ -567,7 +605,236 @@ func (s *Shell) cmdGetWithContext(ctx context.Context, args []string) error {
 	return nil
 }
 
-// cmdPutWithContext uploads a file from local to remote with cancellation support.
+// downloadDirectory downloads a remote directory recursively to local.
+func (s *Shell) downloadDirectory(ctx context.Context, remotePath, localPath string) error {
+	// Get all files in the directory
+	files, totalSize, err := s.getRemoteFileList(remotePath)
+	if err != nil {
+		return fmt.Errorf("scan remote directory: %w", err)
+	}
+
+	if len(files) == 0 {
+		// Create empty directory
+		if err := os.MkdirAll(localPath, 0755); err != nil {
+			return fmt.Errorf("create local directory: %w", err)
+		}
+		fmt.Fprintf(s.stdout, "Downloaded empty directory: %s\n", remotePath)
+		return nil
+	}
+
+	fmt.Fprintf(s.stdout, "\nDownloading %s (%d files, %s total)\n", remotePath, len(files), formatBytes(totalSize))
+
+	var downloadedSize int64
+	var downloadedCount int
+	var failedFiles []string
+
+	for i, file := range files {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return context.Canceled
+		default:
+		}
+
+		// Calculate progress prefix
+		progressPrefix := fmt.Sprintf("[%d/%d]", i+1, len(files))
+
+		// Download the file
+		fileLocalPath := filepath.Join(localPath, file.RelPath)
+		fileRemotePath := joinPath(remotePath, file.RelPath)
+
+		// Create parent directories
+		if err := os.MkdirAll(filepath.Dir(fileLocalPath), 0755); err != nil {
+			fmt.Fprintf(s.stdout, "Warning: failed to create directory for %s: %v\n", file.RelPath, err)
+			failedFiles = append(failedFiles, file.RelPath)
+			continue
+		}
+
+		if err := s.downloadSingleFileWithPrefix(ctx, fileRemotePath, fileLocalPath, progressPrefix); err != nil {
+			fmt.Fprintf(s.stdout, "Warning: failed to download %s: %v\n", file.RelPath, err)
+			failedFiles = append(failedFiles, file.RelPath)
+			continue
+		}
+
+		downloadedSize += file.Size
+		downloadedCount++
+	}
+
+	// Report results
+	if len(failedFiles) > 0 {
+		fmt.Fprintf(s.stdout, "\nDownload completed with %d failures:\n", len(failedFiles))
+		for _, f := range failedFiles {
+			fmt.Fprintf(s.stdout, "  - %s\n", f)
+		}
+	}
+	fmt.Fprintf(s.stdout, "Download complete: %d/%d files, %s/%s downloaded\n",
+		downloadedCount, len(files), formatBytes(downloadedSize), formatBytes(totalSize))
+
+	if len(failedFiles) > 0 {
+		return fmt.Errorf("%d files failed to download", len(failedFiles))
+	}
+	return nil
+}
+
+// remoteFileInfo holds information about a remote file.
+type remoteFileInfo struct {
+	RelPath string
+	Size    int64
+}
+
+// getRemoteFileList recursively lists all files in a remote directory.
+func (s *Shell) getRemoteFileList(remotePath string) ([]remoteFileInfo, int64, error) {
+	var files []remoteFileInfo
+	var totalSize int64
+
+	err := s.walkRemoteDir(remotePath, "", &files, &totalSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return files, totalSize, nil
+}
+
+// walkRemoteDir recursively walks a remote directory.
+func (s *Shell) walkRemoteDir(basePath, relPath string, files *[]remoteFileInfo, totalSize *int64) error {
+	currentPath := basePath
+	if relPath != "" {
+		currentPath = joinPath(basePath, relPath)
+	}
+
+	entries, err := s.client.ReadDir(currentPath)
+	if err != nil {
+		return fmt.Errorf("read dir %s: %w", currentPath, err)
+	}
+
+	for _, entry := range entries {
+		entryRelPath := entry.Name()
+		if relPath != "" {
+			entryRelPath = joinPath(relPath, entry.Name())
+		}
+
+		mode := entry.Mode()
+
+		// Skip special files (symlinks, devices, sockets, pipes)
+		if mode&os.ModeSymlink != 0 || mode&os.ModeDevice != 0 || mode&os.ModeNamedPipe != 0 || mode&os.ModeSocket != 0 {
+			continue
+		}
+
+		// Use Mode().IsDir() for more reliable directory detection
+		if mode.IsDir() {
+			// Recurse into subdirectory
+			if err := s.walkRemoteDir(basePath, entryRelPath, files, totalSize); err != nil {
+				return err
+			}
+		} else if mode.IsRegular() {
+			*files = append(*files, remoteFileInfo{
+				RelPath: entryRelPath,
+				Size:    entry.Size(),
+			})
+			*totalSize += entry.Size()
+		}
+	}
+
+	return nil
+}
+
+// downloadSingleFileWithPrefix downloads a single file with a progress prefix.
+func (s *Shell) downloadSingleFileWithPrefix(ctx context.Context, remotePath, localPath, prefix string) error {
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Open remote file
+	srcFile, err := s.client.Open(remotePath)
+	if err != nil {
+		return fmt.Errorf("open remote: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat remote: %w", err)
+	}
+
+	// Create local file
+	dstFile, err := os.Create(localPath)
+	if err != nil {
+		return fmt.Errorf("create local: %w", err)
+	}
+	defer func() {
+		dstFile.Close()
+		// Remove file if cancelled
+		if ctx.Err() == context.Canceled {
+			os.Remove(localPath)
+		}
+	}()
+
+	// Create progress bar with prefix
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription(fmt.Sprintf("%s %s", prefix, filepath.Base(remotePath))),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap writer to track progress
+	progressWriter := &progressWriter{
+		writer: dstFile,
+		bar:    bar,
+		ctx:    ctx,
+	}
+
+	// Use io.CopyBuffer with large buffer for better performance
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	written, err := io.CopyBuffer(progressWriter, srcFile, buf)
+	if err != nil {
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("copy file: %w", err)
+	}
+
+	// Verify file size matches expected
+	if written != fi.Size() {
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("incomplete download: got %d bytes, expected %d bytes", written, fi.Size())
+	}
+
+	// Sync to ensure data is written to disk
+	if err := dstFile.Sync(); err != nil {
+		dstFile.Close()
+		os.Remove(localPath)
+		return fmt.Errorf("sync file: %w", err)
+	}
+
+	// Close file explicitly before returning
+	if err := dstFile.Close(); err != nil {
+		os.Remove(localPath)
+		return fmt.Errorf("close file: %w", err)
+	}
+
+	bar.Close()
+	fmt.Fprintln(s.stdout)
+	return nil
+}
+
+// cmdPutWithContext uploads a file or directory from local to remote with cancellation support.
 func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
 	if len(args) < 1 {
 		return fmt.Errorf("usage: put local-path [remote-path]")
@@ -588,9 +855,32 @@ func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
 		return fmt.Errorf("resolve remote: %w", err)
 	}
 
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Check if local path is a directory
+	localInfo, err := os.Stat(localPath)
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
+
+	if localInfo.IsDir() {
+		return s.uploadDirectory(ctx, localPath, remotePath)
+	}
+
+	// Single file upload
+	return s.uploadSingleFile(ctx, localPath, remotePath)
+}
+
+// uploadSingleFile uploads a single file from local to remote.
+func (s *Shell) uploadSingleFile(ctx context.Context, localPath, remotePath string) error {
 	// Check if remote path is a directory, if so append the filename
-	if stat, err := s.client.Stat(remotePath); err == nil && stat.IsDir() {
-		remotePath = filepath.Join(remotePath, filepath.Base(localPath))
+	if stat, err := s.client.Stat(remotePath); err == nil && stat.Mode().IsDir() {
+		remotePath = joinPath(remotePath, filepath.Base(localPath))
 	}
 
 	// Check for cancellation before starting
@@ -688,6 +978,246 @@ func (s *Shell) cmdPutWithContext(ctx context.Context, args []string) error {
 	return nil
 }
 
+// uploadDirectory uploads a local directory recursively to remote.
+func (s *Shell) uploadDirectory(ctx context.Context, localPath, remotePath string) error {
+	// Get all files in the directory
+	files, totalSize, err := s.getLocalFileList(localPath)
+	if err != nil {
+		return fmt.Errorf("scan local directory: %w", err)
+	}
+
+	// Check if remote path exists and what type it is
+	if stat, err := s.client.Stat(remotePath); err == nil {
+		if !stat.Mode().IsDir() {
+			return fmt.Errorf("remote path '%s' already exists and is not a directory (it's a %s)", remotePath, stat.Mode())
+		}
+		// Directory exists, we'll upload into it
+	} else {
+		// Path doesn't exist, create it
+		if err := s.client.MkdirAll(remotePath); err != nil {
+			return fmt.Errorf("create remote directory '%s': %w", remotePath, err)
+		}
+	}
+
+	if len(files) == 0 {
+		fmt.Fprintf(s.stdout, "Uploaded empty directory: %s\n", remotePath)
+		return nil
+	}
+
+	fmt.Fprintf(s.stdout, "\nUploading %s (%d files, %s total)\n", localPath, len(files), formatBytes(totalSize))
+
+	var uploadedSize int64
+	var uploadedCount int
+	var failedFiles []string
+
+	for i, file := range files {
+		// Check for cancellation
+		select {
+		case <-ctx.Done():
+			return context.Canceled
+		default:
+		}
+
+		// Calculate progress prefix
+		progressPrefix := fmt.Sprintf("[%d/%d]", i+1, len(files))
+
+		// Upload the file
+		fileLocalPath := filepath.Join(localPath, file.RelPath)
+		fileRemotePath := joinPath(remotePath, file.RelPath)
+
+		// Create parent directories
+		if err := s.client.MkdirAll(filepath.Dir(fileRemotePath)); err != nil {
+			fmt.Fprintf(s.stdout, "Warning: failed to create directory for %s: %v\n", file.RelPath, err)
+			failedFiles = append(failedFiles, file.RelPath)
+			continue
+		}
+
+		if err := s.uploadSingleFileWithPrefix(ctx, fileLocalPath, fileRemotePath, progressPrefix); err != nil {
+			fmt.Fprintf(s.stdout, "Warning: failed to upload %s: %v\n", file.RelPath, err)
+			failedFiles = append(failedFiles, file.RelPath)
+			continue
+		}
+
+		uploadedSize += file.Size
+		uploadedCount++
+	}
+
+	// Report results
+	if len(failedFiles) > 0 {
+		fmt.Fprintf(s.stdout, "\nUpload completed with %d failures:\n", len(failedFiles))
+		for _, f := range failedFiles {
+			fmt.Fprintf(s.stdout, "  - %s\n", f)
+		}
+	}
+	fmt.Fprintf(s.stdout, "Upload complete: %d/%d files, %s/%s uploaded\n",
+		uploadedCount, len(files), formatBytes(uploadedSize), formatBytes(totalSize))
+
+	if len(failedFiles) > 0 {
+		return fmt.Errorf("%d files failed to upload", len(failedFiles))
+	}
+	return nil
+}
+
+// localFileInfo holds information about a local file.
+type localFileInfo struct {
+	RelPath string
+	Size    int64
+}
+
+// getLocalFileList recursively lists all files in a local directory.
+func (s *Shell) getLocalFileList(localPath string) ([]localFileInfo, int64, error) {
+	var files []localFileInfo
+	var totalSize int64
+
+	err := s.walkLocalDir(localPath, "", &files, &totalSize)
+	if err != nil {
+		return nil, 0, err
+	}
+
+	return files, totalSize, nil
+}
+
+// walkLocalDir recursively walks a local directory.
+func (s *Shell) walkLocalDir(basePath, relPath string, files *[]localFileInfo, totalSize *int64) error {
+	currentPath := basePath
+	if relPath != "" {
+		currentPath = filepath.Join(basePath, relPath)
+	}
+
+	entries, err := os.ReadDir(currentPath)
+	if err != nil {
+		return fmt.Errorf("read dir %s: %w", currentPath, err)
+	}
+
+	for _, entry := range entries {
+		entryRelPath := entry.Name()
+		if relPath != "" {
+			entryRelPath = filepath.Join(relPath, entry.Name())
+		}
+
+		if entry.IsDir() {
+			// Recurse into subdirectory
+			if err := s.walkLocalDir(basePath, entryRelPath, files, totalSize); err != nil {
+				return err
+			}
+		} else {
+			info, err := entry.Info()
+			if err != nil {
+				return fmt.Errorf("get file info %s: %w", entryRelPath, err)
+			}
+			*files = append(*files, localFileInfo{
+				RelPath: entryRelPath,
+				Size:    info.Size(),
+			})
+			*totalSize += info.Size()
+		}
+	}
+
+	return nil
+}
+
+// uploadSingleFileWithPrefix uploads a single file with a progress prefix.
+func (s *Shell) uploadSingleFileWithPrefix(ctx context.Context, localPath, remotePath, prefix string) error {
+	// Check if remote path is a directory, if so append the filename
+	if stat, err := s.client.Stat(remotePath); err == nil && stat.Mode().IsDir() {
+		remotePath = joinPath(remotePath, filepath.Base(localPath))
+	}
+
+	// Check for cancellation before starting
+	select {
+	case <-ctx.Done():
+		return context.Canceled
+	default:
+	}
+
+	// Open local file
+	srcFile, err := os.Open(localPath)
+	if err != nil {
+		return fmt.Errorf("open local: %w", err)
+	}
+	defer srcFile.Close()
+
+	// Get file info
+	fi, err := srcFile.Stat()
+	if err != nil {
+		return fmt.Errorf("stat local: %w", err)
+	}
+
+	// Create remote file
+	dstFile, err := s.client.Create(remotePath)
+	if err != nil {
+		return fmt.Errorf("create remote: %w", err)
+	}
+	fileClosed := false
+	defer func() {
+		if !fileClosed {
+			_ = dstFile.Close()
+		}
+		// Remove file if cancelled
+		if ctx.Err() == context.Canceled {
+			s.client.Remove(remotePath)
+		}
+	}()
+
+	// Create progress bar with prefix
+	bar := progressbar.NewOptions64(
+		fi.Size(),
+		progressbar.OptionSetWriter(os.Stderr),
+		progressbar.OptionSetDescription(fmt.Sprintf("%s %s", prefix, filepath.Base(localPath))),
+		progressbar.OptionShowBytes(true),
+		progressbar.OptionShowCount(),
+		progressbar.OptionSetItsString("bytes"),
+		progressbar.OptionSetRenderBlankState(true),
+		progressbar.OptionThrottle(100*time.Millisecond),
+		progressbar.OptionSetTheme(progressbar.Theme{
+			Saucer:        "=",
+			SaucerHead:    ">",
+			SaucerPadding: " ",
+			BarStart:      "[",
+			BarEnd:        "]",
+		}),
+	)
+	defer bar.Close()
+
+	// Wrap reader with progress tracking
+	progressReader := &progressReader{
+		reader: srcFile,
+		bar:    bar,
+		size:   fi.Size(),
+	}
+
+	// Use io.CopyBuffer with large buffer
+	buf := make([]byte, 1024*1024) // 1MB buffer
+	written, err := io.CopyBuffer(dstFile, progressReader, buf)
+	if err != nil {
+		if err == context.Canceled {
+			return context.Canceled
+		}
+		dstFile.Close()
+		fileClosed = true
+		s.client.Remove(remotePath)
+		return fmt.Errorf("upload: %w", err)
+	}
+
+	// Verify upload completed
+	if written != fi.Size() {
+		dstFile.Close()
+		fileClosed = true
+		s.client.Remove(remotePath)
+		return fmt.Errorf("incomplete upload: sent %d bytes, expected %d bytes", written, fi.Size())
+	}
+
+	// Close remote file to finalize
+	if err := dstFile.Close(); err != nil {
+		return fmt.Errorf("close remote file: %w", err)
+	}
+	fileClosed = true
+
+	bar.Close()
+	fmt.Fprintln(s.stdout)
+	return nil
+}
+
 // cmdMkdir creates a directory on the remote server.
 func (s *Shell) cmdMkdir(args []string) error {
 	if len(args) < 1 {
@@ -751,8 +1281,8 @@ func (s *Shell) cmdHelp() error {
 		{"lpwd", "", "Print local working directory"},
 		{"ls", "[path]", "List remote files"},
 		{"lls", "[path]", "List local files"},
-		{"get", "<remote> [local]", "Download file"},
-		{"put", "<local> [remote]", "Upload file"},
+		{"get", "<remote> [local]", "Download file or directory"},
+		{"put", "<local> [remote]", "Upload file or directory"},
 		{"mkdir", "<path>", "Create remote directory"},
 		{"lmkdir", "<path>", "Create local directory"},
 		{"exit", "", "Exit SFTP shell"},
