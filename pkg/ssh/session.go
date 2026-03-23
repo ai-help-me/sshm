@@ -49,6 +49,13 @@ func RequestPTY(session *ssh.Session, config *SessionConfig) error {
 		return fmt.Errorf("request pty: %w", err)
 	}
 
+	// Set TERM environment variable to ensure compatibility.
+	// SSH protocol automatically forwards the local TERM to the remote server,
+	// which can cause issues with newer terminal types (e.g., xterm-ghostty)
+	// that may not have terminfo definitions on remote servers.
+	// We explicitly set it to a widely-supported terminal type.
+	session.Setenv("TERM", config.Term)
+
 	return nil
 }
 
