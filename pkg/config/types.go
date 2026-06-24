@@ -173,6 +173,8 @@ func DefaultConfigPaths() ([]string, error) {
 	return []string{
 		filepath.Join(home, ".sshm.yaml"),
 		filepath.Join(home, ".sshw.yaml"),
+		filepath.Join(home, ".sshw.yml"),
+		filepath.Join(home, ".sshw"),
 	}, nil
 }
 
